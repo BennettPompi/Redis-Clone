@@ -8,13 +8,17 @@ use std::thread;
 use std::env;
 use std::time;
 use bloomfilter::Bloom;
+
 enum Commands{
     Ping,
     Time,
     Hset(String, String),
     Hget(String),
     Hdel(String),
-    Hexists(String)
+    Hexists(String), 
+    BFReserve(usize, f64),
+    BFAdd(String),
+    BFExists(String)
 }
 
 fn parse_command(request: &str)->Option<Commands>
@@ -60,6 +64,48 @@ fn parse_command(request: &str)->Option<Commands>
                 None
             }
         }
+        "bfreserve" => {
+            if req_vec.len() == 3{
+                let items_parse = req_vec[1].parse::<usize>();
+                match items_parse{
+                    Ok(items) =>{
+                        let fp_parse = req_vec[2].parse::<f64>();
+                        match fp_parse{
+                            Ok(fp) =>{
+                                Some(Commands::BFReserve(items, fp))
+                            }
+                            Err(_) =>{
+                                //println!("Something went wrong. Check parameters.");
+                                return None;
+                            }
+                        }
+                    }
+                    Err(_) =>{
+                        //println!("Something went wrong. Check parameters.");
+                        return None;
+                    }
+                }
+            }
+            else{
+                None
+            }
+        }
+        "bfexists" => {
+            if req_vec.len() >= 2{
+                Some(Commands::BFExists(req_vec[1..].join(" ")))
+            }
+            else{
+                None
+            }
+        }
+        "bfadd" => {
+            if req_vec.len() >= 2{
+                Some(Commands::BFAdd(req_vec[1..].join(" ")))
+            }
+            else{
+                None
+            }
+        }
         _ => {
             None
         }
@@ -76,8 +122,7 @@ fn time()-> String
     time
 }
 fn handle_client(mut stream: UnixStream, 
-    map:Arc<RwLock<HashMap<String, String>>>) -> std::io::Result<()>{
-    
+    map:Arc<RwLock<HashMap<String, String>>>, bf_arc:Arc<RwLock<Bloom<String>>>) -> std::io::Result<()>{
     let mut request = String::new();
     let mut response = String::new();
     let mut buffer = [0; 1024];
@@ -85,7 +130,7 @@ fn handle_client(mut stream: UnixStream,
         match stream.read(&mut buffer) {
             Ok(bytes_read) if bytes_read == 0 => {
                 // Connection closed by the client.
-                println!("Connection closed by client.");
+                //println!("Connection closed by client.");
                 break;
             }
             Ok(bytes_read) => {
@@ -97,7 +142,7 @@ fn handle_client(mut stream: UnixStream,
                 if received_data.contains(&b'\n') {
                     // Process the complete message.
                     // You can add logic to handle different types of requests.
-                    println!("in received with request: {}", request);
+                    //println!("in received with request: {}", request);
                     // Prepare a response.
                     let cmd: Option<Commands> = parse_command(request.as_str());
                     match cmd
@@ -109,38 +154,93 @@ fn handle_client(mut stream: UnixStream,
                             response.push_str(&time())
                         }
                         Some(Commands::Hset(key, value)) => {
-                            let mut map = map.write().unwrap();
-                            match map.insert(key, value){
-                                None => response.push_str("1\n"),
-                                Some(a) => {
-                                    let res: String = "Overwrote value: ".to_owned() + &a + "\n";
-                                    response.push_str(res.as_str())
+                            let map_res = map.write();
+                            match map_res{
+                                Ok(mut map) =>{
+                                    match map.insert(key, value){
+                                        None => response.push_str("1\n"),
+                                        Some(a) => {
+                                            let res: String = "Overwrote value: ".to_owned() + &a + "\n";
+                                            response.push_str(res.as_str())
+                                        }
+                                    }
+                                }
+                                Err(_) => {
+                                    response.push_str("0")
                                 }
                             }
                             
                         }
                         Some(Commands::Hget(key)) => {
-                            let map = map.read().unwrap();
-                            let res: String;
-                            match map.get(&key){
-                                Some(val)=> {
-                                    res = val.to_string() + "\n";
+                            let map_res = map.read();
+                            let res; 
+                            match map_res{
+                                Ok(map) => {
+                                    match map.get(&key){
+                                        Some(val)=> {
+                                            res = val.to_string() + "\n";
+                                        }
+                                        None => {res = "Value not found. Please try another \n".to_string();}
+                                    }
                                 }
-                                None => {res = "Value not found. Please try another \n".to_string();}
+                                Err(_) => {
+                                    res = "Something went wrong. \n".to_string();
+                                }
                             }
                             response.push_str(&res)
                         }
                         Some(Commands::Hdel(key)) => {
-                            let mut map = map.write().unwrap();
-                            match map.remove(&key){
-                                Some(_) => {response.push_str("1\n")}
-                                None => {response.push_str("0\n")}
+                            let map_res = map.write();
+                            match map_res{
+                                Ok(mut map) =>{
+                                    match map.remove(&key){
+                                        Some(_) => {response.push_str("1\n")}
+                                        None => {response.push_str("0\n")}
+                                    }
+                                }
+                                Err(_) => {response.push_str("Something went wrong. \n")}
                             }
                             
                         }
                         Some(Commands::Hexists(key)) => {
-                            let map = map.read().unwrap();
-                            let ret = map.contains_key(&key).to_string() + "\n";
+                            let map_res = map.read();
+                            let ret: String;
+                            match map_res{
+                                Ok(map) => {ret = map.contains_key(&key).to_string() + "\n";}
+                                Err(_) =>{ret = "Something went wrong. \n".to_string()}
+                            }
+                            response.push_str(&ret)
+                        }
+                        Some(Commands::BFReserve(items, fp)) => {
+                            let bf_res = bf_arc.write();
+                            match bf_res{
+                                Ok(mut bf)=>{
+                                    *bf = bloomfilter::Bloom::new_for_fp_rate(items, fp);
+                                    //println!("{:?}\n", *bf);
+                                    response.push_str("1\n")
+                                }
+                                Err(_)=>{response.push_str("Something went wrong\n")}
+                            }
+                            
+                        }
+                        Some(Commands::BFAdd(item)) => {
+                            let bf_res = bf_arc.write();
+                            match bf_res{
+                                Ok(mut bf) =>{
+                                    bf.set(&item);
+                                    response.push_str("1\n")
+                                }
+                                Err(_) =>{response.push_str("Something went wrong\n")}
+                            }
+                            
+                        }
+                        Some(Commands::BFExists(item)) => {
+                            let bf_res = bf_arc.read();
+                            let ret: String; 
+                            match bf_res{
+                                Ok(bf)=>{ret = bf.check(&item).to_string() + "\n";}
+                                Err(_)=>{ret = "Something went wrong\n".to_string()}
+                            }                           
                             response.push_str(&ret)
                         }
                         None => {
@@ -157,7 +257,7 @@ fn handle_client(mut stream: UnixStream,
                 }
             }
             Err(err) => {
-                eprintln!("Error reading from connection: {:?}", err);
+                println!("Error reading from connection: {:?}", err);
                 break;
             }
         }
@@ -169,6 +269,10 @@ fn main() -> std::io::Result<()> {
     let args: Vec<String> = env::args().collect();
     let socket_path = &args[1];
     let map: Arc<RwLock<HashMap<String, String>>> = Arc::new(RwLock::new(HashMap::new()));
+    
+    let shared_bf : Arc<RwLock<bloomfilter::Bloom<String>>> = 
+        Arc::new(RwLock::new(bloomfilter::Bloom::new_for_fp_rate(1000, 0.01)));
+
     // Remove the socket file if it already exists.
     let _ = remove_file(socket_path);
 
@@ -178,10 +282,12 @@ fn main() -> std::io::Result<()> {
     // Accept incoming connections and handle them in a loop.
     for stream in listener.incoming() {
         let map_clone: Arc<RwLock<HashMap<String, String>>> = Arc::clone(&map);
+        let bf_clone: Arc<RwLock<Bloom<String>>> = Arc::clone(&shared_bf);
+
         thread::spawn(move || 
             match stream {
                 Ok(stream) => {
-                    let res = handle_client(stream, map_clone);
+                    let res = handle_client(stream, map_clone, bf_clone);
                     let thread_id_str = format!("{:?}", thread::current().id());
                     match res {
                         Ok(_) => println!("{} ok", thread_id_str),
@@ -189,7 +295,7 @@ fn main() -> std::io::Result<()> {
                     }
                 }
                 Err(err) => {
-                    eprintln!("Error accepting connection: {:?}", err);
+                    println!("Error accepting connection: {:?}", err);
                 }
             }
         );
